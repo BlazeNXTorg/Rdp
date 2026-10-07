@@ -4,28 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       runner_size:
-        description: "Select Machine Power / Spec"
+        description: "Runner - windows-latest = 4 vCPU / 16 GB because this repo is public"
         type: choice
         required: true
         default: "windows-latest"
         options:
           - "windows-latest"
-          - "windows-latest-8-core"
-          - "windows-latest-16-core"
-          - "windows-latest-32-core"
-          - "windows-latest-64-core"
-          - "windows-gpu"
-          - "self-hosted"
+          - "windows-2025"
+          - "windows-2022"
       rdp_username:
-        description: "Custom Username"
+        description: "Custom Username (password always comes from the RDP_PASSWORD secret)"
         required: false
         default: "BlazeAdmin"
-      rdp_password:
-        description: "Custom Password (blank for secure auto-generate)"
-        required: false
-        default: ""
       setup_desktop_profile:
         description: "Install Developer Suite (Chrome, VS Code, Git, Python, NodeJS, 7-Zip)"
+        type: boolean
+        required: false
+        default: true
+      docker_mode:
+        description: "Start Docker Engine (Windows containers) and keep a container running"
         type: boolean
         required: false
         default: true
@@ -37,6 +34,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: blazenxt-rdp
+  cancel-in-progress: false
 
 jobs:
   blazenxt-rdp:
@@ -58,11 +59,14 @@ jobs:
           $os = Get-CimInstance Win32_OperatingSystem
           $totalRamGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
           $freeDiskGB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+          $vis = "${{ github.event.repository.visibility }}"
+          if ([string]::IsNullOrWhiteSpace($vis)) { $vis = "unknown" }
 
           Write-Host "=========================================================="
           Write-Host "         >>> BlazeNXTOrg CLOUD WORKSTATION <<<            "
           Write-Host "=========================================================="
           Write-Host " Organization: $env:ORG_BRAND"
+          Write-Host " Repo vis:     $vis"
           Write-Host " Architecture: $($os.OSArchitecture) | $($os.Caption)"
           Write-Host " CPU:          $($cpu.Name)"
           Write-Host " Logical vCPU: $($cpu.NumberOfLogicalProcessors) Cores"
@@ -125,31 +129,29 @@ jobs:
               $username = $username.Trim()
           }
 
-          $customPass = "${{ github.event.inputs.rdp_password }}"
-          if ($customPass -and $customPass.Trim().Length -ge 8) {
-              $password = $customPass.Trim()
-          } else {
-              $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+"
-              $bytes = New-Object byte[] 22
-              [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-              $sb = New-Object System.Text.StringBuilder
-              for ($i = 0; $i -lt 22; $i++) {
-                  [void]$sb.Append($chars[$bytes[$i] % $chars.Length])
-              }
-              $password = $sb.ToString()
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          if ([string]::IsNullOrWhiteSpace($password) -or $password.Trim().Length -lt 8) {
+              Write-Host "[-] Repo secret RDP_PASSWORD is missing or too short."
+              Write-Host "[-] This repo is public, so the password CANNOT come from a dispatch input"
+              Write-Host "[-] (dispatch inputs are visible on the public run page)."
+              Write-Host "[-] Add it at: Settings > Secrets and variables > Actions > New repository secret"
+              exit 1
           }
-
+          $password = $password.Trim()
           Write-Host "::add-mask::$password"
 
           $secPass = ConvertTo-SecureString $password -AsPlainText -Force
 
           Write-Host "[BlazeNXT] Creating account: $username"
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Remove-LocalUser -Name $username
+          }
           New-LocalUser -Name $username -Password $secPass -AccountNeverExpires -Description "BlazeNXT Workstation Administrator" | Out-Null
           Add-LocalGroupMember -Group "Administrators" -Member $username | Out-Null
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username | Out-Null
 
           Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
-          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$password"
+          Write-Host "[BlazeNXT] Account ready (password held in the repo secret, never logged)."
 
       - name: Attach BlazeNXT Tailscale Node
         uses: tailscale/github-action@v3
@@ -158,7 +160,7 @@ jobs:
           hostname: "blazenxt-ws-${{ github.run_id }}"
           args: ${{ github.event.inputs.tailscale_exit_node == 'true' && '--advertise-exit-node' || '' }}
 
-      - name: Resolve Tailscale Node IP
+      - name: Resolve Tailscale Node IP & MagicDNS Name
         shell: powershell
         run: |
           Set-StrictMode -Version Latest
@@ -185,9 +187,17 @@ jobs:
               Write-Error "[-] Could not retrieve assigned Tailscale IP."
               exit 1
           }
-
           Write-Host "[BlazeNXT] Dedicated IP: $tsIP"
+
+          $dnsName = "blazenxt-ws-$env:GITHUB_RUN_ID"
+          try {
+              $status = & $tailscaleBin status --json | ConvertFrom-Json
+              if ($status.Self.DNSName) { $dnsName = $status.Self.DNSName.TrimEnd('.') }
+          } catch {}
+          Write-Host "[BlazeNXT] MagicDNS name: $dnsName"
+
           Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_DNS=$dnsName"
 
       - name: Setup Desktop Information & Diagnostics File
         shell: powershell
@@ -207,7 +217,9 @@ jobs:
             "=====================================================",
             " Organization : BlazeNXTOrg",
             " Hostname     : blazenxt-ws-${{ github.run_id }}",
-            " Dedicated IP : $env:TAILSCALE_IP:3389",
+            " MagicDNS     : $env:TAILSCALE_DNS",
+            " Dedicated IP : $env:TAILSCALE_IP",
+            " RDP Target   : $env:TAILSCALE_IP:3389",
             " User         : $env:RDP_USER",
             " OS           : $($os.Caption)",
             " Processor    : $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) vCPUs)",
@@ -216,6 +228,7 @@ jobs:
             " Features Active:",
             " - Audio Redirection: Enabled",
             " - Clipboard / Drive Sync: Enabled",
+            " - Docker Engine (Windows containers): see step 'Docker Engine'",
             " - Max Session Duration: ~5.9 Hours",
             "====================================================="
           )
@@ -242,6 +255,41 @@ jobs:
               winget install --id $tool --exact --silent --accept-package-agreements --accept-source-agreements --force
           }
 
+      - name: Docker Engine (Windows Containers) Setup
+        if: ${{ github.event.inputs.docker_mode == 'true' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          Write-Host "[BlazeNXT] Bringing up Docker Engine (Windows containers)..."
+
+          try { Set-Service -Name docker -StartupType Automatic -ErrorAction Stop } catch { Write-Warning "docker service lookup failed: $_" }
+
+          $dockerReady = $false
+          $containerOs = $null
+          for ($i = 1; $i -le 24; $i++) {
+              try {
+                  $svc = Get-Service -Name docker -ErrorAction Stop
+                  if ($svc.Status -ne 'Running') { Start-Service -Name docker -ErrorAction Stop }
+              } catch {}
+              $out = docker version --format "{{.Server.Os}}" 2>$null
+              if ($LASTEXITCODE -eq 0 -and $out) { $dockerReady = $true; $containerOs = $out; break }
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not $dockerReady) {
+              Write-Warning "[BlazeNXT] Docker daemon did not respond - skipping container startup."
+              exit 0
+          }
+
+          Write-Host "[BlazeNXT] Docker server online - container OS: $containerOs"
+          docker info --format "Server: {{.ServerVersion}} | Containers: {{.Containers}} | Images: {{.Images}}"
+
+          Write-Host "[BlazeNXT] Pulling a base image and starting the keep-alive container..."
+          docker pull mcr.microsoft.com/windows/nanoserver:ltsc2025
+          docker rm -f blazenxt-keepalive 2>$null | Out-Null
+          docker run -d --restart unless-stopped --name blazenxt-keepalive mcr.microsoft.com/windows/nanoserver:ltsc2025 ping -t localhost
+          docker ps --format "table {{.Names}}`t{{.Image}}`t{{.Status}}"
+
       - name: Verify RDP Port Accessibility
         shell: powershell
         run: |
@@ -252,21 +300,55 @@ jobs:
           }
           Write-Host "[BlazeNXT] RDP Port 3389 verified online and responding."
 
+      - name: Publish Connection Summary
+        shell: powershell
+        run: |
+          $lines = @(
+            "# BlazeNXT Workstation Online",
+            "",
+            "| Item | Value |",
+            "|---|---|",
+            "| Tailscale node | blazenxt-ws-$env:GITHUB_RUN_ID |",
+            "| MagicDNS | $env:TAILSCALE_DNS |",
+            "| Tailscale IP | $env:TAILSCALE_IP |",
+            "| RDP target | $env:TAILSCALE_IP:3389 |",
+            "| Username | $env:RDP_USER |",
+            "| Password | the RDP_PASSWORD repo secret |",
+            "| Run ID | $env:GITHUB_RUN_ID |",
+            "",
+            "## Connect from your phone",
+            "1. Install **Tailscale** and sign in to the same tailnet.",
+            "2. Install **Remote Desktop** by Microsoft.",
+            "3. New PC -> Address: blazenxt-ws-$env:GITHUB_RUN_ID",
+            "4. Log in with the username above and the RDP_PASSWORD secret value.",
+            "",
+            "NOTE: the machine is destroyed when this run ends (355 min max)."
+          )
+          ($lines -join [Environment]::NewLine) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
+
       - name: BlazeNXT Workstation Session Monitor & Keep-Alive
         shell: powershell
         run: |
           $startTime = Get-Date
           $intervalMinutes = 5
 
+          $containers = (docker ps --format "{{.Names}}") -join ", "
+          if (-not $containers) { $containers = "none" }
+
           Write-Host "=========================================================="
           Write-Host "         >>> BlazeNXTOrg WORKSTATION READY <<<            "
           Write-Host "=========================================================="
           Write-Host " Organization: BlazeNXTOrg"
+          Write-Host " Tailscale:    blazenxt-ws-$env:GITHUB_RUN_ID"
+          Write-Host " MagicDNS:     $env:TAILSCALE_DNS"
           Write-Host " Host (IP):    $env:TAILSCALE_IP:3389"
-          Write-Host " Hostname:     blazenxt-ws-$env:GITHUB_RUN_ID"
           Write-Host " Username:     $env:RDP_USER"
-          Write-Host " Password:     $env:RDP_PASS"
+          Write-Host " Password:     stored in the RDP_PASSWORD repo secret"
+          Write-Host " Docker:       $containers"
           Write-Host " Session Max:  355 Minutes (~5.9 Hours)"
+          Write-Host "=========================================================="
+          Write-Host " Connect from phone: Tailscale app + Remote Desktop app,"
+          Write-Host " then add PC: blazenxt-ws-$env:GITHUB_RUN_ID"
           Write-Host "=========================================================="
 
           while ($true) {
@@ -274,6 +356,7 @@ jobs:
               $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
               $freeRamMB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024, 1)
               $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
-              
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Health: OK | Active: ${elapsed}m | CPU Load: ${cpuLoad}% | Free RAM: ${freeRamMB} MB"
+              $running = @(docker ps -q 2>$null).Count
+
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Health: OK | Active: ${elapsed}m | CPU Load: ${cpuLoad}% | Free RAM: ${freeRamMB} MB | Docker containers: $running"
           }
