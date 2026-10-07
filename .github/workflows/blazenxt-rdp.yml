@@ -1,0 +1,279 @@
+name: BlazeNXT Workstation Cloud RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_size:
+        description: "Select Machine Power / Spec"
+        type: choice
+        required: true
+        default: "windows-latest"
+        options:
+          - "windows-latest"
+          - "windows-latest-8-core"
+          - "windows-latest-16-core"
+          - "windows-latest-32-core"
+          - "windows-latest-64-core"
+          - "windows-gpu"
+          - "self-hosted"
+      rdp_username:
+        description: "Custom Username"
+        required: false
+        default: "BlazeAdmin"
+      rdp_password:
+        description: "Custom Password (blank for secure auto-generate)"
+        required: false
+        default: ""
+      setup_desktop_profile:
+        description: "Install Developer Suite (Chrome, VS Code, Git, Python, NodeJS, 7-Zip)"
+        type: boolean
+        required: false
+        default: true
+      tailscale_exit_node:
+        description: "Advertise Node as Tailscale Exit Node"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  blazenxt-rdp:
+    name: "BlazeNXT-${{ github.event.inputs.runner_size || 'windows-latest' }}"
+    runs-on: ${{ github.event.inputs.runner_size || 'windows-latest' }}
+    timeout-minutes: 355
+
+    env:
+      ORG_BRAND: "BlazeNXTOrg"
+
+    steps:
+      - name: System Audit & BlazeNXT Environment Initialization
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $os = Get-CimInstance Win32_OperatingSystem
+          $totalRamGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+          $freeDiskGB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+
+          Write-Host "=========================================================="
+          Write-Host "         >>> BlazeNXTOrg CLOUD WORKSTATION <<<            "
+          Write-Host "=========================================================="
+          Write-Host " Organization: $env:ORG_BRAND"
+          Write-Host " Architecture: $($os.OSArchitecture) | $($os.Caption)"
+          Write-Host " CPU:          $($cpu.Name)"
+          Write-Host " Logical vCPU: $($cpu.NumberOfLogicalProcessors) Cores"
+          Write-Host " Physical RAM: $totalRamGB GB"
+          Write-Host " C: Storage:   $freeDiskGB GB Free"
+          Write-Host " Run ID:       ${{ github.run_id }}"
+          Write-Host "=========================================================="
+
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null | Out-Null
+          powercfg -change -monitor-timeout-ac 0
+          powercfg -change -disk-timeout-ac 0
+          powercfg -change -standby-timeout-ac 0
+
+          New-Item -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Force 2>$null | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' `
+                           -Name "DoNotOpenServerManagerAtLogon" -PropertyType DWORD -Value 1 -Force 2>$null | Out-Null
+
+      - name: Enable Remote Desktop, Audio Redirection & Clipboard Sharing
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          Write-Host "[BlazeNXT] Enabling Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "fDisableAudioCapture" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-Service -Name AudioSrv -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name AudioSrv -ErrorAction SilentlyContinue
+
+          $tsPolicies = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $tsPolicies -Force | Out-Null
+          Set-ItemProperty -Path $tsPolicies -Name "fDisableClip" -Value 0 -Force
+          Set-ItemProperty -Path $tsPolicies -Name "fDisableCdm" -Value 0 -Force
+          Set-ItemProperty -Path $tsPolicies -Name "SelectTransport" -Value 1 -Force
+
+          Write-Host "[BlazeNXT] Whitelisting RDP Port 3389..."
+          netsh advfirewall firewall delete rule name="BlazeNXT-RDP" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="BlazeNXT-RDP" `
+              dir=in action=allow protocol=TCP localport=3389 profile=any | Out-Null
+
+          Restart-Service -Name TermService -Force
+
+      - name: Provision BlazeNXT User & Credentials
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $username = "${{ github.event.inputs.rdp_username }}"
+          if (-not $username -or $username.Trim() -eq "") {
+              $username = "BlazeAdmin"
+          } else {
+              $username = $username.Trim()
+          }
+
+          $customPass = "${{ github.event.inputs.rdp_password }}"
+          if ($customPass -and $customPass.Trim().Length -ge 8) {
+              $password = $customPass.Trim()
+          } else {
+              $chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+"
+              $bytes = New-Object byte[] 22
+              [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+              $sb = New-Object System.Text.StringBuilder
+              for ($i = 0; $i -lt 22; $i++) {
+                  [void]$sb.Append($chars[$bytes[$i] % $chars.Length])
+              }
+              $password = $sb.ToString()
+          }
+
+          Write-Host "::add-mask::$password"
+
+          $secPass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          Write-Host "[BlazeNXT] Creating account: $username"
+          New-LocalUser -Name $username -Password $secPass -AccountNeverExpires -Description "BlazeNXT Workstation Administrator" | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member $username | Out-Null
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username | Out-Null
+
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_USER=$username"
+          Add-Content -Path $env:GITHUB_ENV -Value "RDP_PASS=$password"
+
+      - name: Attach BlazeNXT Tailscale Node
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: "blazenxt-ws-${{ github.run_id }}"
+          args: ${{ github.event.inputs.tailscale_exit_node == 'true' && '--advertise-exit-node' || '' }}
+
+      - name: Resolve Tailscale Node IP
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+
+          $tailscaleBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $tsIP = $null
+          $attempts = 0
+
+          Write-Host "[BlazeNXT] Querying Tailscale IP..."
+          while (-not $tsIP -and $attempts -lt 15) {
+              try {
+                  $output = & $tailscaleBin ip -4
+                  if ($output -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$") {
+                      $tsIP = $output.Trim()
+                      break
+                  }
+              } catch {}
+              Start-Sleep -Seconds 4
+              $attempts++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "[-] Could not retrieve assigned Tailscale IP."
+              exit 1
+          }
+
+          Write-Host "[BlazeNXT] Dedicated IP: $tsIP"
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$tsIP"
+
+      - name: Setup Desktop Information & Diagnostics File
+        shell: powershell
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'SilentlyContinue'
+
+          $desktopPath = "C:\Users\Public\Desktop"
+          $infoFile = "$desktopPath\BlazeNXT_Workstation_Info.txt"
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+
+          $lines = @(
+            "=====================================================",
+            "         WELCOME TO BlazeNXTOrg CLOUD WORKSTATION",
+            "=====================================================",
+            " Organization : BlazeNXTOrg",
+            " Hostname     : blazenxt-ws-${{ github.run_id }}",
+            " Dedicated IP : $env:TAILSCALE_IP:3389",
+            " User         : $env:RDP_USER",
+            " OS           : $($os.Caption)",
+            " Processor    : $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) vCPUs)",
+            " RAM          : $([math]::Round($os.TotalVisibleMemorySize / 1MB, 2)) GB",
+            "",
+            " Features Active:",
+            " - Audio Redirection: Enabled",
+            " - Clipboard / Drive Sync: Enabled",
+            " - Max Session Duration: ~5.9 Hours",
+            "====================================================="
+          )
+          ($lines -join [Environment]::NewLine) | Out-File -FilePath $infoFile -Encoding UTF8
+
+      - name: Install BlazeNXT Software Bundle
+        if: ${{ github.event.inputs.setup_desktop_profile == 'true' }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          Write-Host "[BlazeNXT] Deploying workstation software suite via Winget..."
+
+          $tools = @(
+            "Google.Chrome",
+            "Microsoft.VisualStudioCode",
+            "7zip.7zip",
+            "Git.Git",
+            "Python.Python.3.11",
+            "OpenJS.NodeJS.LTS"
+          )
+
+          foreach ($tool in $tools) {
+              Write-Host "[*] Installing $tool..."
+              winget install --id $tool --exact --silent --accept-package-agreements --accept-source-agreements --force
+          }
+
+      - name: Verify RDP Port Accessibility
+        shell: powershell
+        run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "[-] Port 3389 test failed on $env:TAILSCALE_IP"
+              exit 1
+          }
+          Write-Host "[BlazeNXT] RDP Port 3389 verified online and responding."
+
+      - name: BlazeNXT Workstation Session Monitor & Keep-Alive
+        shell: powershell
+        run: |
+          $startTime = Get-Date
+          $intervalMinutes = 5
+
+          Write-Host "=========================================================="
+          Write-Host "         >>> BlazeNXTOrg WORKSTATION READY <<<            "
+          Write-Host "=========================================================="
+          Write-Host " Organization: BlazeNXTOrg"
+          Write-Host " Host (IP):    $env:TAILSCALE_IP:3389"
+          Write-Host " Hostname:     blazenxt-ws-$env:GITHUB_RUN_ID"
+          Write-Host " Username:     $env:RDP_USER"
+          Write-Host " Password:     $env:RDP_PASS"
+          Write-Host " Session Max:  355 Minutes (~5.9 Hours)"
+          Write-Host "=========================================================="
+
+          while ($true) {
+              Start-Sleep -Seconds ($intervalMinutes * 60)
+              $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
+              $freeRamMB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024, 1)
+              $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+              
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Health: OK | Active: ${elapsed}m | CPU Load: ${cpuLoad}% | Free RAM: ${freeRamMB} MB"
+          }
