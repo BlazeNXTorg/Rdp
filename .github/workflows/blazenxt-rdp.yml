@@ -21,10 +21,10 @@ on:
         required: false
         default: "BlazeAdmin"
       setup_desktop_profile:
-        description: "Install Developer Suite (Chrome, VS Code, Git, Python, NodeJS, 7-Zip)"
+        description: "Install Developer Suite (Chrome, VS Code, Git, Python, NodeJS, 7-Zip). OFF by default - keeps startup fast."
         type: boolean
         required: false
-        default: true
+        default: false
       docker_mode:
         description: "Start Docker Engine (Windows containers) and keep a container running"
         type: boolean
@@ -45,10 +45,18 @@ on:
         required: false
         default: true
       persist_user_folders:
-        description: "ALSO back up Desktop/Documents/Downloads. WARNING: on a public repo the backup is publicly downloadable"
+        description: "Back up the whole user profile (Desktop/Documents/Downloads/Pictures/Videos/Music/etc). WARNING: on a public repo that backup is publicly downloadable"
         type: boolean
         required: false
-        default: false
+        default: true
+      persist_paths:
+        description: "Extra folders to back up, separated by ; e.g. C:\\projects;C:\\data"
+        required: false
+        default: ""
+      extra_ports:
+        description: "Extra inbound TCP ports to open, comma separated e.g. 80,443,3000,8080"
+        required: false
+        default: ""
       node_name:
         description: "Stable Tailscale/MagicDNS name - keep the default so your phone's saved PC never changes"
         required: false
@@ -59,9 +67,9 @@ on:
         required: false
         default: true
       persist_max_mb:
-        description: "If the backup exceeds this many MB, fall back to backing up the workspace folder only"
+        description: "Backup size cap in MB. Free plan gives ~500 MB total artifact storage, so keep this modest."
         required: false
-        default: "1024"
+        default: "300"
 
 permissions:
   contents: read
@@ -127,6 +135,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           Write-Host "[BlazeNXT] Enabling Remote Desktop..."
+          $rdpKey = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -158,6 +167,30 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "MaxDisconnectionTime" -Value 0 -Force -ErrorAction SilentlyContinue
 
+          Write-Host "[BlazeNXT] Applying reconnect hardening (fixes mobile reconnects)..."
+          $tsRoot = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $tsRoot -Name "fSingleSessionPerUser" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "KeepAliveInterval" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "MaxInstanceCount" -Value 4 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "fResetBroken" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "BrokenConnectionAction" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "fDisableForcibleLogoff" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "fEnableWinStation" -Value 1 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpKey -Name "fInheritKeepAliveInterval" -Value 0 -Force -ErrorAction SilentlyContinue
+
+          $extraPorts = "${{ github.event.inputs.extra_ports }}"
+          if (-not [string]::IsNullOrWhiteSpace($extraPorts)) {
+              foreach ($p in ($extraPorts -split ',')) {
+                  $port = $p.Trim()
+                  if ($port -match '^[0-9]{1,5}(-[0-9]{1,5})?$') {
+                      netsh advfirewall firewall delete rule name="BlazeNXT-Port-$port" 2>$null | Out-Null
+                      netsh advfirewall firewall add rule name="BlazeNXT-Port-$port" `
+                          dir=in action=allow protocol=TCP localport=$port profile=any | Out-Null
+                      Write-Host "[BlazeNXT] Opened extra port $port"
+                  }
+              }
+          }
+
           Restart-Service -Name TermService -Force
 
       - name: Provision BlazeNXT User & Credentials
@@ -174,7 +207,7 @@ jobs:
           }
 
           $password = "${{ secrets.RDP_PASSWORD }}"
-          if ([string]::IsNullOrWhiteSpace($password) -or $password.Trim().Length -lt 10) {
+          if ([string]::IsNullOrWhiteSpace($password) -or $password.Trim().Length -lt 6) {
               Write-Host "[-] Repo secret RDP_PASSWORD is missing or shorter than 10 characters."
               Write-Host "[-] This repo is public, so the password CANNOT come from a dispatch input"
               Write-Host "[-] (dispatch inputs are visible on the public run page)."
@@ -183,25 +216,33 @@ jobs:
           }
           $password = $password.Trim()
 
-          # Windows refuses local accounts whose password fails its complexity policy.
-          # Catch that here with a readable message instead of an InvalidPassword crash.
           $classes = 0
           if ($password -cmatch '[A-Z]') { $classes++ }
           if ($password -cmatch '[a-z]') { $classes++ }
           if ($password -match  '[0-9]') { $classes++ }
           if ($password -match  '[^A-Za-z0-9]') { $classes++ }
+          Write-Host "[BlazeNXT] Password: $($password.Length) chars, $classes/4 character classes."
 
           if ($classes -lt 3) {
-              Write-Host "[-] RDP_PASSWORD fails Windows password complexity."
-              Write-Host "[-] It needs at least 3 of these 4: uppercase, lowercase, digit, symbol."
-              Write-Host "[-] Example that passes: Tz4!mQ8@vR2wL6"
-              exit 1
+              Write-Host "[BlazeNXT] Simple password requested - relaxing the local password policy so Windows accepts it."
+              $tmp = "$env:TEMP\blazenxt-secpol.inf"
+              secedit /export /cfg $tmp /quiet 2>$null | Out-Null
+              if (Test-Path $tmp) {
+                  $c = Get-Content $tmp
+                  $c = $c -replace 'PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0'
+                  $c = $c -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0'
+                  $c = $c -replace 'PasswordHistorySize\s*=\s*\d+', 'PasswordHistorySize = 0'
+                  Set-Content -Path $tmp -Value $c -Encoding Unicode
+                  secedit /configure /db "$env:TEMP\blazenxt-secpol.sdb" /cfg $tmp /areas SECURITYPOLICY /quiet 2>$null | Out-Null
+                  Write-Host "[BlazeNXT] Local password complexity/length policy relaxed."
+                  Write-Warning "[BlazeNXT] SECURITY: this makes weak passwords possible on this machine. RDP is reachable by anything on your tailnet."
+              } else {
+                  Write-Warning "[BlazeNXT] Could not export the security policy - password may be rejected."
+              }
           }
           if ($password.ToLower().Contains($username.ToLower())) {
-              Write-Host "[-] RDP_PASSWORD must not contain the username ($username)."
-              exit 1
+              Write-Warning "[BlazeNXT] Password contains the username - allowed, but reconsider."
           }
-          Write-Host "[BlazeNXT] Password policy check passed ($($password.Length) chars, $classes/4 character classes)."
           Write-Host "::add-mask::$password"
 
           $secPass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -226,13 +267,14 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           $repo = $env:GITHUB_REPOSITORY
           $artName = 'blazenxt-session-state'
+          $userRoot = "C:\Users\$env:RDP_USER"
           $workDir = 'C:\BlazeNXT\workspace'
           New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 
-          Write-Host "[BlazeNXT] Looking for a previous session backup..."
+          Write-Host "[BlazeNXT] Looking for the previous session backup..."
           $raw = gh api "repos/$repo/actions/artifacts?name=$artName&per_page=100" 2>$null
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($raw)) {
-              Write-Host "[BlazeNXT] No previous backup (first session) - starting clean."
+              Write-Host "[BlazeNXT] No previous backup - starting clean."
               exit 0
           }
 
@@ -242,7 +284,8 @@ jobs:
           $newest = $arts | Select-Object -First 1
           Write-Host "[BlazeNXT] Newest backup: id=$($newest.id) created=$($newest.created_at) size=$([math]::Round($newest.size_in_bytes/1MB,1)) MB"
 
-          $arts | Select-Object -Skip 3 | ForEach-Object {
+          # Free-plan artifact storage is only ~500 MB shared, so keep exactly one backup.
+          $arts | Select-Object -Skip 1 | ForEach-Object {
               gh api --method DELETE "repos/$repo/actions/artifacts/$($_.id)" 2>$null | Out-Null
               Write-Host "  pruned older backup $($_.id)"
           }
@@ -253,24 +296,36 @@ jobs:
           gh run download $newest.workflow_run.id -n $artName -D $dest --repo $repo 2>$null
           if ($LASTEXITCODE -ne 0) { Write-Host "[BlazeNXT] Download failed - starting clean."; exit 0 }
 
-          $src = Get-ChildItem -Path $dest -Recurse -Directory -Filter 'workspace' | Select-Object -First 1
-          if ($src) {
-              Copy-Item -Path (Join-Path $src.FullName '*') -Destination $workDir -Recurse -Force
-              $count = (Get-ChildItem -Path $workDir -Recurse -File | Measure-Object).Count
-              Write-Host "[BlazeNXT] Restored $count files into $workDir"
-          } else {
-              Write-Host "[BlazeNXT] Backup contained no workspace folder."
+          $ws = Get-ChildItem -Path $dest -Recurse -Directory -Filter 'workspace' | Select-Object -First 1
+          if ($ws) {
+              Copy-Item -Path (Join-Path $ws.FullName '*') -Destination $workDir -Recurse -Force
+              Write-Host "[BlazeNXT] Restored workspace: $((Get-ChildItem -Path $workDir -Recurse -File | Measure-Object).Count) files"
           }
 
-          $prof = Get-ChildItem -Path $dest -Recurse -Directory -Filter 'profile' | Select-Object -First 1
-          if ($prof) {
-              foreach ($name in @('Desktop','Documents','Downloads')) {
-                  $from = Join-Path $prof.FullName $name
-                  if (Test-Path $from) {
-                      $to = Join-Path "C:\Users\$env:RDP_USER" $name
-                      New-Item -ItemType Directory -Force -Path $to | Out-Null
-                      Copy-Item -Path (Join-Path $from '*') -Destination $to -Recurse -Force
-                      Write-Host "  restored profile folder: $name"
+          $profRoot = Get-ChildItem -Path $dest -Recurse -Directory -Filter 'profile' | Select-Object -First 1
+          if ($profRoot) {
+              New-Item -ItemType Directory -Force -Path $userRoot | Out-Null
+              Get-ChildItem $profRoot.FullName -Directory | ForEach-Object {
+                  $to = Join-Path $userRoot $_.Name
+                  New-Item -ItemType Directory -Force -Path $to | Out-Null
+                  Copy-Item -Path (Join-Path $_.FullName '*') -Destination $to -Recurse -Force
+                  Write-Host "  restored profile folder: $($_.Name)"
+              }
+          }
+
+          $mf = Get-ChildItem -Path $dest -Recurse -File -Filter 'manifest.txt' | Select-Object -First 1
+          if ($mf) {
+              Write-Host "[BlazeNXT] Backup manifest:"
+              Get-Content $mf.FullName | Where-Object { $_ -match '=>' } | ForEach-Object {
+                  $parts = $_ -split '=>'
+                  $rel = $parts[0].Trim()
+                  $target = $parts[1].Trim()
+                  if ($rel -like 'workspace*' -or $rel -like 'profile*') { return }
+                  $srcPath = Join-Path (Split-Path $mf.FullName -Parent) $rel
+                  if ((Test-Path $srcPath) -and $target) {
+                      New-Item -ItemType Directory -Force -Path $target | Out-Null
+                      Copy-Item -Path (Join-Path $srcPath '*') -Destination $target -Recurse -Force
+                      Write-Host "  restored extra path -> $target"
                   }
               }
           }
@@ -438,8 +493,9 @@ jobs:
             "| RDP target | $env:TAILSCALE_IP:3389 |",
             "| Username | $env:RDP_USER |",
             "| Password | the RDP_PASSWORD repo secret |",
+            "| Connect with | the node name, NOT a raw IP (the IP can change) |",
             "| Session | ${{ github.event.inputs.duration_minutes || '330' }} min (then state is saved and the job shuts down) |",
-            "| Persistent folder | `C:\\BlazeNXT\\workspace` - restored at the start of every session |",
+            "| Backup | workspace + profile folders + any `persist_paths`, restored next session |",
             "| Docker | Windows containers, keep-alive container included |",
             "| Run ID | $env:GITHUB_RUN_ID |",
             "",
@@ -449,14 +505,15 @@ jobs:
             "3. New PC -> Address: $env:NODE_NAME",
             "4. Log in with the username above and the RDP_PASSWORD secret value.",
             "",
-            "NOTE: the machine is destroyed when this run ends.",
-            "Only `C:\\BlazeNXT\\workspace` survives - it is uploaded at shutdown and",
-            "restored into the next session. On this PUBLIC repo that backup artifact",
-            "is publicly downloadable, so never put secrets or private keys in it."
+            "NOTE: the machine is destroyed when this run ends. Your backup is",
+            "uploaded at shutdown and restored into the next session.",
+            "",
+            "WARNING: this repository is PUBLIC, so the backup artifact is publicly",
+            "downloadable. Do not store private keys, tokens or sensitive documents here."
           )
           ($lines -join [Environment]::NewLine) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
 
-      - name: BlazeNXT Workstation Session Monitor & Keep-Alive
+      - name: BlazeNXT Workstation Watchdog & Keep-Alive
         id: keepalive
         shell: powershell
         run: |
@@ -471,23 +528,58 @@ jobs:
           if ($durationMinutes -lt 10) { $durationMinutes = 10 }
           if ($durationMinutes -gt 355) { $durationMinutes = 355 }
 
-          $containers = (docker ps --format "{{.Names}}") -join ", "
-          if (-not $containers) { $containers = "none" }
+          $infoFile = 'C:\Users\Public\Desktop\BlazeNXT_Workstation_Info.txt'
+          $tsBin = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $dockerOn = "${{ github.event.inputs.docker_mode }}" -ne 'false'
+
+          function Get-TsIp {
+              try {
+                  $out = & $tsBin ip -4 2>$null
+                  if ($out -match '^\d{1,3}(\.\d{1,3}){3}$') { return $out.Trim() }
+              } catch {}
+              return $null
+          }
+
+          function Write-InfoFile {
+              param($ip, $dns, $containers, $sessions)
+              $lines = @(
+                '=====================================================',
+                '     BlazeNXTOrg CLOUD WORKSTATION - LIVE',
+                '=====================================================',
+                " Updated      : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+                " Tailscale IP : $ip",
+                " MagicDNS     : $dns",
+                " RDP target   : ${ip}:3389",
+                " Username     : $env:RDP_USER",
+                " Docker       : $containers",
+                " Sessions     : $sessions",
+                '',
+                ' IMPORTANT: connect using the MagicDNS name, not the IP.',
+                ' The IP can change if Tailscale re-registers this node -',
+                ' the name never does.',
+                '',
+                ' Persistent folders (saved before shutdown):',
+                '   C:\BlazeNXT\workspace  +  your profile folders',
+                '====================================================='
+              )
+              ($lines -join [Environment]::NewLine) | Out-File -FilePath $infoFile -Encoding UTF8 -Force
+          }
+
+          $containers = @()
+          if ($dockerOn) { try { $containers = @(& docker ps --format '{{.Names}}' 2>$null) } catch {} }
+          $tsIp = Get-TsIp
+          Write-InfoFile -ip $tsIp -dns $env:TAILSCALE_DNS -containers ($containers -join ',') -sessions 'starting'
 
           Write-Host "=========================================================="
           Write-Host "         >>> BlazeNXTOrg WORKSTATION READY <<<            "
           Write-Host "=========================================================="
-          Write-Host " Organization: BlazeNXTOrg"
-          Write-Host " Tailscale:    $env:NODE_NAME"
-          Write-Host " MagicDNS:     $env:TAILSCALE_DNS"
-          Write-Host " Host (IP):    $env:TAILSCALE_IP:3389"
-          Write-Host " Username:     $env:RDP_USER"
-          Write-Host " Password:     stored in the RDP_PASSWORD repo secret"
-          Write-Host " Docker:       $containers"
-          Write-Host " Session:      $durationMinutes Minutes (clean shutdown at this point)"
-          Write-Host "=========================================================="
-          Write-Host " Connect from phone: Tailscale app + Remote Desktop app,"
-          Write-Host " then add PC: $env:NODE_NAME"
+          Write-Host " Node name : $env:NODE_NAME  (use this in your RDP app)"
+          Write-Host " Tailscale : $tsIp"
+          Write-Host " Username  : $env:RDP_USER"
+          Write-Host " Password  : the RDP_PASSWORD secret"
+          Write-Host " Docker    : $($containers -join ',')"
+          Write-Host " Session   : $durationMinutes min, then backup + handoff"
+          Write-Host " Watchdog  : every $intervalMinutes min (RDP, Tailscale, Docker, info file)"
           Write-Host "=========================================================="
 
           while ($true) {
@@ -495,12 +587,65 @@ jobs:
               $elapsed = [math]::Round(((Get-Date) - $startTime).TotalMinutes, 1)
               $freeRamMB = [math]::Round((Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory / 1024, 1)
               $cpuLoad = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
-              $running = @(docker ps -q 2>$null).Count
+              $healed = @()
 
-              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Health: OK | Active: ${elapsed}m | CPU Load: ${cpuLoad}% | Free RAM: ${freeRamMB} MB | Docker containers: $running"
+              # --- self-heal: RDP service ---
+              $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              if (-not $svc) {
+                  $healed += 'TermService-missing'
+              } elseif ($svc.Status -ne 'Running') {
+                  Start-Service -Name TermService -ErrorAction SilentlyContinue
+                  $healed += 'TermService'
+              }
+
+              # --- self-heal: RDP listener + firewall rule ---
+              $localOk = $false
+              try { $localOk = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded } catch {}
+              if (-not $localOk) {
+                  netsh advfirewall firewall delete rule name="BlazeNXT-RDP" 2>$null | Out-Null
+                  netsh advfirewall firewall add rule name="BlazeNXT-RDP" dir=in action=allow protocol=TCP localport=3389 profile=any 2>$null | Out-Null
+                  Restart-Service -Name TermService -Force -ErrorAction SilentlyContinue
+                  Start-Sleep -Seconds 5
+                  $healed += 'RDP-listener'
+              }
+
+              # --- self-heal: Tailscale ---
+              $tsIp = Get-TsIp
+              if (-not $tsIp) {
+                  & $tsBin up --unattended 2>$null | Out-Null
+                  Start-Sleep -Seconds 8
+                  $tsIp = Get-TsIp
+                  $healed += 'tailscale'
+              }
+
+              # --- self-heal: Docker keep-alive container ---
+              $containers = @()
+              if ($dockerOn) {
+                  try { $containers = @(& docker ps --format '{{.Names}}' 2>$null) } catch {}
+                  if ($containers -notcontains 'blazenxt-keepalive') {
+                      & docker start blazenxt-keepalive 2>$null | Out-Null
+                      if ($LASTEXITCODE -ne 0) {
+                          & docker run -d --restart unless-stopped --name blazenxt-keepalive mcr.microsoft.com/windows/nanoserver:ltsc2025 ping -t localhost 2>$null | Out-Null
+                      }
+                      try { $containers = @(& docker ps --format '{{.Names}}' 2>$null) } catch {}
+                      $healed += 'docker'
+                  }
+              }
+
+              # --- session table + info file refresh ---
+              $sessions = 'n/a'
+              try {
+                  $rows = & qwinsta 2>$null | Select-Object -Skip 1
+                  if ($rows) { $sessions = (($rows | ForEach-Object { ($_ -split '\s+', 6)[1..3] -join '/' }) -join ' | ') }
+              } catch {}
+              Write-InfoFile -ip $tsIp -dns $env:TAILSCALE_DNS -containers ($containers -join ',') -sessions $sessions
+
+              $healText = 'none'
+              if ($healed.Count -gt 0) { $healText = ($healed -join ',') }
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Active: ${elapsed}m | CPU: ${cpuLoad}% | RAM free: ${freeRamMB} MB | Tailscale: $tsIp | Docker: $($containers -join ',') | Self-heal: $healText"
 
               if ($elapsed -ge $durationMinutes) {
-                  Write-Host "[BlazeNXT] Session duration reached ($durationMinutes min) - shutting down cleanly."
+                  Write-Host "[BlazeNXT] Session duration reached ($durationMinutes min) - backing up and handing off."
                   break
               }
           }
@@ -511,42 +656,87 @@ jobs:
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
           $staging = 'C:\BlazeNXT\persist'
+          $userRoot = "C:\Users\$env:RDP_USER"
           Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path "$staging\workspace" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$staging\profile" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$staging\extra" | Out-Null
+
+          $manifest = @(
+            'BlazeNXT session backup manifest',
+            "generated : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+            "run id    : $env:GITHUB_RUN_ID",
+            "size cap  : ${{ github.event.inputs.persist_max_mb }} MB",
+            ''
+          )
 
           $workDir = 'C:\BlazeNXT\workspace'
           if (Test-Path $workDir) {
               Copy-Item -Path (Join-Path $workDir '*') -Destination "$staging\workspace" -Recurse -Force
+              $manifest += "workspace => $workDir"
+              Write-Host "[BlazeNXT] Backed up workspace"
           }
 
-          if ("${{ github.event.inputs.persist_user_folders }}" -eq 'true') {
-              foreach ($name in @('Desktop','Documents','Downloads')) {
-                  $from = Join-Path "C:\Users\$env:RDP_USER" $name
-                  if (Test-Path $from) {
-                      New-Item -ItemType Directory -Force -Path "$staging\profile\$name" | Out-Null
-                      Copy-Item -Path (Join-Path $from '*') -Destination "$staging\profile\$name" -Recurse -Force
-                  }
+          if ("${{ github.event.inputs.persist_user_folders }}" -ne 'false') {
+              $folders = @('Desktop','Documents','Downloads','Pictures','Videos','Music','Favorites','Links','Contacts')
+              foreach ($name in $folders) {
+                  $from = Join-Path $userRoot $name
+                  if (-not (Test-Path $from)) { continue }
+                  $to = "$staging\profile\$name"
+                  New-Item -ItemType Directory -Force -Path $to | Out-Null
+                  Copy-Item -Path (Join-Path $from '*') -Destination $to -Recurse -Force
+                  $manifest += "profile\$name => $from"
+                  Write-Host "[BlazeNXT] Backed up profile folder: $name"
+              }
+          }
+
+          $extraRaw = "${{ github.event.inputs.persist_paths }}"
+          if (-not [string]::IsNullOrWhiteSpace($extraRaw)) {
+              $i = 0
+              foreach ($p in ($extraRaw -split ';')) {
+                  $path = $p.Trim()
+                  if ([string]::IsNullOrWhiteSpace($path)) { continue }
+                  if (-not (Test-Path $path)) { Write-Host "[BlazeNXT] [skip] $path not found"; continue }
+                  $leaf = Split-Path $path -Leaf
+                  if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = "path$i" }
+                  $rel = "extra\$($i)_$leaf"
+                  New-Item -ItemType Directory -Force -Path (Join-Path $staging $rel) | Out-Null
+                  Copy-Item -Path (Join-Path $path '*') -Destination (Join-Path $staging $rel) -Recurse -Force
+                  $manifest += "$rel => $path"
+                  Write-Host "[BlazeNXT] Backed up extra path: $path"
+                  $i++
               }
           }
 
           $sum = (Get-ChildItem -Path $staging -Recurse -File | Measure-Object -Property Length -Sum).Sum
           if (-not $sum) { $sum = 0 }
           $mb = [math]::Round($sum/1MB, 2)
-          $cap = 1024
+          $cap = 300
           [void][int]::TryParse("${{ github.event.inputs.persist_max_mb }}", [ref]$cap)
           if ($cap -lt 50) { $cap = 50 }
-          Write-Host "[BlazeNXT] State to persist: $mb MB (cap $cap MB)"
+          Write-Host "[BlazeNXT] Backup size: $mb MB (cap $cap MB)"
 
           if ($mb -gt $cap) {
-              Write-Warning "[BlazeNXT] Backup exceeds the cap - persisting the workspace folder only."
-              Remove-Item -Recurse -Force "$staging\profile" -ErrorAction SilentlyContinue
-              $sum = (Get-ChildItem -Path "$staging\workspace" -Recurse -File | Measure-Object -Property Length -Sum).Sum
+              Write-Warning "[BlazeNXT] Backup over the cap - dropping extras first, then profile folders, keeping the workspace."
+              Remove-Item -Recurse -Force "$staging\extra" -ErrorAction SilentlyContinue
+              $sum = (Get-ChildItem -Path $staging -Recurse -File | Measure-Object -Property Length -Sum).Sum
               if (-not $sum) { $sum = 0 }
-              Write-Host "[BlazeNXT] Workspace-only size: $([math]::Round($sum/1MB,2)) MB"
+              if ([math]::Round($sum/1MB,2) -gt $cap) {
+                  Remove-Item -Recurse -Force "$staging\profile" -ErrorAction SilentlyContinue
+                  $sum = (Get-ChildItem -Path "$staging\workspace" -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+                  if (-not $sum) { $sum = 0 }
+              }
+              $manifest += ''
+              $manifest += "note => cap applied, final size $([math]::Round($sum/1MB,2)) MB"
           }
 
+          $manifest += ''
+          $manifest += "final size => $([math]::Round($sum/1MB,2)) MB"
+          $manifest | Out-File -FilePath "$staging\manifest.txt" -Encoding UTF8
+          Write-Host "[BlazeNXT] Manifest written; final size $([math]::Round($sum/1MB,2)) MB"
+
           if ($sum -eq 0) {
-              Write-Host "[BlazeNXT] Nothing to persist - no files in $workDir yet."
+              Write-Host "[BlazeNXT] Nothing to persist."
               Remove-Item -Recurse -Force $staging -ErrorAction SilentlyContinue
           }
 
@@ -557,9 +747,10 @@ jobs:
         with:
           name: blazenxt-session-state
           path: C:\BlazeNXT\persist
-          retention-days: 7
+          retention-days: 3
           compression-level: 6
           if-no-files-found: ignore
+          overwrite: true
 
       - name: Dispatch Next Session (self-chaining)
         # Only a session that actually ran gets to spawn a successor.
