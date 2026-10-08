@@ -1,0 +1,73 @@
+name: BlazeNXT Workstation STOP
+
+# Kill switch. Use this to end any running session and turn the 6-hourly
+# cron off. Nothing here starts or restarts a machine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type STOP to force-cancel every running BlazeNXT session'
+        required: true
+        default: "STOP"
+      disable_schedule:
+        description: "Also disable the 6-hourly cron (recommended - otherwise it restarts in under 6 h)"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  stop:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'STOP' }}
+    steps:
+      - name: Force-cancel running and queued sessions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "Looking for live sessions of blazenxt-rdp.yml ..."
+
+          for status in in_progress queued requested waiting pending; do
+            ids=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/blazenxt-rdp.yml/runs?status=$status&per_page=100" \
+              --jq '.workflow_runs[].id' 2>/dev/null || true)
+            for id in $ids; do
+              [ -z "$id" ] && continue
+              echo "  force-cancelling run $id ($status)"
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/force-cancel" >/dev/null || \
+                echo "    (already finished)"
+            done
+          done
+
+          if [ -z "${ids:-}" ]; then echo "No live sessions found."; fi
+
+      - name: Disable the 6-hourly cron
+        if: ${{ github.event.inputs.disable_schedule == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/blazenxt-rdp.yml/disable" >/dev/null \
+            && echo "Schedule disabled: no new sessions will start until you re-enable it."
+          gh workflow list --repo "$GITHUB_REPOSITORY"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Workstation stopped"
+            echo ""
+            echo "| Action | State |"
+            echo "|---|---|"
+            echo "| Live sessions | force-cancelled |"
+            echo "| 6-hourly cron | ${{ github.event.inputs.disable_schedule == 'true' && 'DISABLED' || 'still enabled' }} |"
+            echo ""
+            echo "### To bring it back"
+            echo "Actions tab -> **BlazeNXT Workstation Cloud RDP** -> **Enable workflow**"
+            echo "(or: \`gh workflow enable blazenxt-rdp.yml\`), then either press"
+            echo "**Run workflow** or let the cron fire at the next 6-hour mark."
+          } >> "$GITHUB_STEP_SUMMARY"

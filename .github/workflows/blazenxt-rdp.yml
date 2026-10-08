@@ -1,6 +1,10 @@
 name: BlazeNXT Workstation Cloud RDP
 
 on:
+  schedule:
+    # Every 6 hours (UTC). Sessions self-stop at 350 min so the next one chains in.
+    # 00:00/06:00/12:00/18:00 UTC = 05:30/11:30/17:30/23:30 IST
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       runner_size:
@@ -51,6 +55,9 @@ jobs:
 
     env:
       ORG_BRAND: "BlazeNXTOrg"
+      # Scheduled runs reuse one stable name so the phone's Remote Desktop entry
+      # never changes. Manual runs keep a per-run name for easy identification.
+      NODE_NAME: ${{ github.event_name == 'schedule' && 'blazenxt-ws' || format('blazenxt-ws-{0}', github.run_id) }}
 
     steps:
       - name: System Audit & BlazeNXT Environment Initialization
@@ -169,7 +176,7 @@ jobs:
         uses: tailscale/github-action@v3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          hostname: "blazenxt-ws-${{ github.run_id }}"
+          hostname: "${{ env.NODE_NAME }}"
           args: ${{ github.event.inputs.tailscale_exit_node == 'true' && '--advertise-exit-node' || '' }}
 
       - name: Resolve Tailscale Node IP & MagicDNS Name
@@ -201,7 +208,7 @@ jobs:
           }
           Write-Host "[BlazeNXT] Dedicated IP: $tsIP"
 
-          $dnsName = "blazenxt-ws-$env:GITHUB_RUN_ID"
+          $dnsName = "$env:NODE_NAME"
           try {
               $status = & $tailscaleBin status --json | ConvertFrom-Json
               if ($status.Self.DNSName) { $dnsName = $status.Self.DNSName.TrimEnd('.') }
@@ -228,7 +235,7 @@ jobs:
             "         WELCOME TO BlazeNXTOrg CLOUD WORKSTATION",
             "=====================================================",
             " Organization : BlazeNXTOrg",
-            " Hostname     : blazenxt-ws-${{ github.run_id }}",
+            " Hostname     : ${{ env.NODE_NAME }}",
             " MagicDNS     : $env:TAILSCALE_DNS",
             " Dedicated IP : $env:TAILSCALE_IP",
             " RDP Target   : $env:TAILSCALE_IP:3389",
@@ -247,7 +254,7 @@ jobs:
           ($lines -join [Environment]::NewLine) | Out-File -FilePath $infoFile -Encoding UTF8
 
       - name: Install BlazeNXT Software Bundle
-        if: ${{ github.event.inputs.setup_desktop_profile == 'true' }}
+        if: ${{ github.event.inputs.setup_desktop_profile != 'false' }}
         shell: powershell
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -268,7 +275,7 @@ jobs:
           }
 
       - name: Docker Engine (Windows Containers) Setup
-        if: ${{ github.event.inputs.docker_mode == 'true' }}
+        if: ${{ github.event.inputs.docker_mode != 'false' }}
         shell: powershell
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -320,7 +327,7 @@ jobs:
             "",
             "| Item | Value |",
             "|---|---|",
-            "| Tailscale node | blazenxt-ws-$env:GITHUB_RUN_ID |",
+            "| Tailscale node | $env:NODE_NAME |",
             "| MagicDNS | $env:TAILSCALE_DNS |",
             "| Tailscale IP | $env:TAILSCALE_IP |",
             "| RDP target | $env:TAILSCALE_IP:3389 |",
@@ -333,7 +340,7 @@ jobs:
             "## Connect from your phone",
             "1. Install **Tailscale** and sign in to the same tailnet.",
             "2. Install **Remote Desktop** by Microsoft.",
-            "3. New PC -> Address: blazenxt-ws-$env:GITHUB_RUN_ID",
+            "3. New PC -> Address: $env:NODE_NAME",
             "4. Log in with the username above and the RDP_PASSWORD secret value.",
             "",
             "NOTE: the machine is destroyed when this run ends (355 min max)."
@@ -346,8 +353,11 @@ jobs:
           $startTime = Get-Date
           $intervalMinutes = 5
 
-          [int]$durationMinutes = 355
-          [void][int]::TryParse("${{ github.event.inputs.duration_minutes }}", [ref]$durationMinutes)
+          $durationRaw = "${{ github.event.inputs.duration_minutes }}"
+          [int]$durationMinutes = 350
+          if (-not [string]::IsNullOrWhiteSpace($durationRaw)) {
+              [void][int]::TryParse($durationRaw, [ref]$durationMinutes)
+          }
           if ($durationMinutes -lt 10) { $durationMinutes = 10 }
           if ($durationMinutes -gt 355) { $durationMinutes = 355 }
 
@@ -358,7 +368,7 @@ jobs:
           Write-Host "         >>> BlazeNXTOrg WORKSTATION READY <<<            "
           Write-Host "=========================================================="
           Write-Host " Organization: BlazeNXTOrg"
-          Write-Host " Tailscale:    blazenxt-ws-$env:GITHUB_RUN_ID"
+          Write-Host " Tailscale:    $env:NODE_NAME"
           Write-Host " MagicDNS:     $env:TAILSCALE_DNS"
           Write-Host " Host (IP):    $env:TAILSCALE_IP:3389"
           Write-Host " Username:     $env:RDP_USER"
@@ -367,7 +377,7 @@ jobs:
           Write-Host " Session:      $durationMinutes Minutes (clean shutdown at this point)"
           Write-Host "=========================================================="
           Write-Host " Connect from phone: Tailscale app + Remote Desktop app,"
-          Write-Host " then add PC: blazenxt-ws-$env:GITHUB_RUN_ID"
+          Write-Host " then add PC: $env:NODE_NAME"
           Write-Host "=========================================================="
 
           while ($true) {
