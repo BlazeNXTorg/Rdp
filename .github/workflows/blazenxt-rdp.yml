@@ -569,20 +569,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $repo = $env:GITHUB_REPOSITORY
           $wf = 'blazenxt-rdp.yml'
-          $argList = @()
+          $apiArgs = @('api', '--method', 'POST', "repos/$repo/actions/workflows/$wf/dispatches", '-f', 'ref=main')
 
           $runner = "${{ github.event.inputs.runner_size }}"
-          if ($runner) { $argList += @('-f', "runner_size=$runner") }
+          if ($runner) { $apiArgs += @('-f', "inputs[runner_size]=$runner") }
 
           $dur = "${{ github.event.inputs.duration_minutes }}"
-          if ($dur) { $argList += @('-f', "duration_minutes=$dur") }
+          if ($dur) { $apiArgs += @('-f', "inputs[duration_minutes]=$dur") }
 
           $user = "${{ github.event.inputs.rdp_username }}"
-          if ($user) { $argList += @('-f', "rdp_username=$user") }
+          if ($user) { $apiArgs += @('-f', "inputs[rdp_username]=$user") }
 
           $node = "${{ github.event.inputs.node_name }}"
-          if ($node) { $argList += @('-f', "node_name=$node") }
+          if ($node) { $apiArgs += @('-f', "inputs[node_name]=$node") }
 
           foreach ($pair in @(
               @{k='setup_desktop_profile'; v="${{ github.event.inputs.setup_desktop_profile }}"},
@@ -591,20 +592,18 @@ jobs:
               @{k='persist_state';          v="${{ github.event.inputs.persist_state }}"},
               @{k='persist_user_folders';   v="${{ github.event.inputs.persist_user_folders }}"}
           )) {
-              if ($pair.v) { $argList += @('-f', "$($pair.k)=$($pair.v)") }
+              if ($pair.v) { $apiArgs += @('-f', "inputs[$($pair.k)]=$($pair.v)") }
           }
 
           Write-Host "[BlazeNXT] Dispatching the next session so the chain keeps running..."
-          if ($argList.Count -gt 0) {
-              & gh workflow run $wf --ref main --repo $env:GITHUB_REPOSITORY $argList
-          } else {
-              & gh workflow run $wf --ref main --repo $env:GITHUB_REPOSITORY
-          }
-
+          # gh api uses an absolute path, so it needs no git checkout (the bug that
+          # killed the first chained dispatch with 'fatal: not a git repository').
+          & gh $apiArgs
           if ($LASTEXITCODE -ne 0) {
-              Write-Warning "[BlazeNXT] Dispatch failed - the 6-hourly cron is the fallback."
+              Write-Warning "[BlazeNXT] Dispatch via API failed - trying gh workflow run..."
+              & gh workflow run $wf --ref main --repo $repo
+              if ($LASTEXITCODE -ne 0) { Write-Warning "[BlazeNXT] Both dispatch methods failed - the cron is the fallback." }
           } else {
               Write-Host "[BlazeNXT] Next session queued. It starts as soon as this machine is destroyed."
           }
-          gh run list --workflow=$wf --repo $env:GITHUB_REPOSITORY --limit 4 2>$null
           exit 0
