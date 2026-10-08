@@ -31,6 +31,10 @@ on:
         type: boolean
         required: false
         default: false
+      duration_minutes:
+        description: "Session length in minutes (10-355). Job ends cleanly here instead of burning the full 355."
+        required: false
+        default: "355"
 
 permissions:
   contents: read
@@ -113,6 +117,14 @@ jobs:
           netsh advfirewall firewall delete rule name="BlazeNXT-RDP" 2>$null | Out-Null
           netsh advfirewall firewall add rule name="BlazeNXT-RDP" `
               dir=in action=allow protocol=TCP localport=3389 profile=any | Out-Null
+
+          Write-Host "[BlazeNXT] Disabling idle / disconnect timeouts for long mobile sessions..."
+          Set-ItemProperty -Path $tsPolicies -Name "MaxIdleTime" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $tsPolicies -Name "MaxDisconnectionTime" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxIdleTime" -Value 0 -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxDisconnectionTime" -Value 0 -Force -ErrorAction SilentlyContinue
 
           Restart-Service -Name TermService -Force
 
@@ -314,6 +326,8 @@ jobs:
             "| RDP target | $env:TAILSCALE_IP:3389 |",
             "| Username | $env:RDP_USER |",
             "| Password | the RDP_PASSWORD repo secret |",
+            "| Session | ${{ github.event.inputs.duration_minutes || '355' }} min (then clean shutdown) |",
+            "| Docker | Windows containers, keep-alive container included |",
             "| Run ID | $env:GITHUB_RUN_ID |",
             "",
             "## Connect from your phone",
@@ -332,6 +346,11 @@ jobs:
           $startTime = Get-Date
           $intervalMinutes = 5
 
+          [int]$durationMinutes = 355
+          [void][int]::TryParse("${{ github.event.inputs.duration_minutes }}", [ref]$durationMinutes)
+          if ($durationMinutes -lt 10) { $durationMinutes = 10 }
+          if ($durationMinutes -gt 355) { $durationMinutes = 355 }
+
           $containers = (docker ps --format "{{.Names}}") -join ", "
           if (-not $containers) { $containers = "none" }
 
@@ -345,7 +364,7 @@ jobs:
           Write-Host " Username:     $env:RDP_USER"
           Write-Host " Password:     stored in the RDP_PASSWORD repo secret"
           Write-Host " Docker:       $containers"
-          Write-Host " Session Max:  355 Minutes (~5.9 Hours)"
+          Write-Host " Session:      $durationMinutes Minutes (clean shutdown at this point)"
           Write-Host "=========================================================="
           Write-Host " Connect from phone: Tailscale app + Remote Desktop app,"
           Write-Host " then add PC: blazenxt-ws-$env:GITHUB_RUN_ID"
@@ -359,4 +378,9 @@ jobs:
               $running = @(docker ps -q 2>$null).Count
 
               Write-Host "[$(Get-Date -Format 'HH:mm:ss')] [BlazeNXT] Health: OK | Active: ${elapsed}m | CPU Load: ${cpuLoad}% | Free RAM: ${freeRamMB} MB | Docker containers: $running"
+
+              if ($elapsed -ge $durationMinutes) {
+                  Write-Host "[BlazeNXT] Session duration reached ($durationMinutes min) - shutting down cleanly."
+                  break
+              }
           }
