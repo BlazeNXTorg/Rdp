@@ -49,6 +49,11 @@ on:
         type: boolean
         required: false
         default: false
+      chain_next_session:
+        description: "When this session ends, automatically start the next one (the chain is more reliable than cron)"
+        type: boolean
+        required: false
+        default: true
       persist_max_mb:
         description: "If the backup exceeds this many MB, fall back to backing up the workspace folder only"
         required: false
@@ -529,3 +534,46 @@ jobs:
           retention-days: 7
           compression-level: 6
           if-no-files-found: ignore
+
+      - name: Dispatch Next Session (self-chaining)
+        if: ${{ always() && github.event.inputs.chain_next_session != 'false' }}
+        continue-on-error: true
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $wf = 'blazenxt-rdp.yml'
+          $argList = @()
+
+          $runner = "${{ github.event.inputs.runner_size }}"
+          if ($runner) { $argList += @('-f', "runner_size=$runner") }
+
+          $dur = "${{ github.event.inputs.duration_minutes }}"
+          if ($dur) { $argList += @('-f', "duration_minutes=$dur") }
+
+          $user = "${{ github.event.inputs.rdp_username }}"
+          if ($user) { $argList += @('-f', "rdp_username=$user") }
+
+          foreach ($pair in @(
+              @{k='setup_desktop_profile'; v="${{ github.event.inputs.setup_desktop_profile }}"},
+              @{k='docker_mode';            v="${{ github.event.inputs.docker_mode }}"},
+              @{k='tailscale_exit_node';    v="${{ github.event.inputs.tailscale_exit_node }}"},
+              @{k='persist_state';          v="${{ github.event.inputs.persist_state }}"},
+              @{k='persist_user_folders';   v="${{ github.event.inputs.persist_user_folders }}"}
+          )) {
+              if ($pair.v) { $argList += @('-f', "$($pair.k)=$($pair.v)") }
+          }
+
+          Write-Host "[BlazeNXT] Dispatching the next session so the chain keeps running..."
+          if ($argList.Count -gt 0) {
+              & gh workflow run $wf --ref main $argList
+          } else {
+              & gh workflow run $wf --ref main
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Warning "[BlazeNXT] Dispatch failed - the 6-hourly cron is the fallback."
+          } else {
+              Write-Host "[BlazeNXT] Next session queued. It starts as soon as this machine is destroyed."
+          }
+          gh run list --workflow=$wf --limit 4 2>$null
