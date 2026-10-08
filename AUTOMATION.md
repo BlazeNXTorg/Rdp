@@ -1,5 +1,26 @@
 # BlazeNXT Workstation — Always-On Automation
 
+## v7 upgrade — reconnect fixes, watchdog, full backup
+
+**Two reconnect bugs fixed**
+| Symptom | Real cause | Fix |
+|---|---|---|
+| Close the app, reconnect fails | Old session stuck in *Disconnected*; a new connect was refused and nothing cleaned it up | `KeepAliveInterval=1`, `fResetBroken=1`, `BrokenConnectionAction=1`, `MaxInstanceCount=4`, `fSingleSessionPerUser=0` |
+| Tailscale reconnect, then RDP fails | Node re-registered with a new IP while the client cached the old one | Connect by MagicDNS name; watchdog re-runs `tailscale up` and rewrites the info file with the live IP |
+
+**Self-healing watchdog (every 5 min)** — RDP service, RDP listener + firewall rule,
+Tailscale, Docker container, desktop info file refresh.
+
+**Full backup before handoff** — workspace + profile folders (Desktop, Documents,
+Downloads, Pictures, Videos, Music, Favorites, Links, Contacts) + custom
+`persist_paths`, with a `manifest.txt`. Cap 300 MB.
+*Not* backed up: the OS, installed apps, or a full disk image — the artifact
+quota is ~500 MB, so a 14 GB disk image is impossible.
+
+**Faster** — tools install is off by default, so RDP is ready in ~2 minutes.
+**Simple passwords** — the workflow relaxes the local complexity policy via
+`secedit`. Warning: this makes weak passwords possible machine-wide.
+
 ## Status: LIVE
 
 | | |
