@@ -49,6 +49,10 @@ on:
         type: boolean
         required: false
         default: false
+      node_name:
+        description: "Stable Tailscale/MagicDNS name - keep the default so your phone's saved PC never changes"
+        required: false
+        default: "blazenxt-ws"
       chain_next_session:
         description: "When this session ends, automatically start the next one (the chain is more reliable than cron)"
         type: boolean
@@ -75,9 +79,10 @@ jobs:
 
     env:
       ORG_BRAND: "BlazeNXTOrg"
-      # Scheduled runs reuse one stable name so the phone's Remote Desktop entry
-      # never changes. Manual runs keep a per-run name for easy identification.
-      NODE_NAME: ${{ github.event_name == 'schedule' && 'blazenxt-ws' || format('blazenxt-ws-{0}', github.run_id) }}
+      # One stable name for every session - cron, manual and chained alike - so the
+      # phone's saved Remote Desktop entry keeps working forever. Override with the
+      # node_name input if you ever want a differently-named machine.
+      NODE_NAME: ${{ github.event.inputs.node_name || 'blazenxt-ws' }}
 
     steps:
       - name: System Audit & BlazeNXT Environment Initialization
@@ -553,6 +558,9 @@ jobs:
 
           $user = "${{ github.event.inputs.rdp_username }}"
           if ($user) { $argList += @('-f', "rdp_username=$user") }
+
+          $node = "${{ github.event.inputs.node_name }}"
+          if ($node) { $argList += @('-f', "node_name=$node") }
 
           foreach ($pair in @(
               @{k='setup_desktop_profile'; v="${{ github.event.inputs.setup_desktop_profile }}"},
