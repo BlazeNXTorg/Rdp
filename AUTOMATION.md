@@ -14,22 +14,31 @@
 
 ---
 
-## How the chain works
+## How the chain works (two mechanisms)
+
+**1. Self-chaining (primary).** The last step of every session dispatches the next
+run itself, with the same options. The replacement starts the moment the old
+machine dies — no scheduler involved, no waiting on GitHub's cron queue.
+
+**2. Cron every 6 h (backstop).** `0 */6 * * *` catches the case where a session is
+killed before it reaches its final step (hard 6 h cut, force-cancel, runner failure).
+
+Sessions stop at **330 min** so the state upload and the successor dispatch both
+happen before GitHub's 355 min ceiling.
+
+### Raw timeline
 
 ```
-05:30 IST  cron fires  ──> session starts (~2 min boot + ~5 min provisioning)
-11:20 IST  session self-stops at 350 min
-11:30 IST  next cron fires ──> queued, starts as soon as runner is free
-17:20 IST  self-stop  ... and so on, forever
+16:50 IST  session ends  -> state uploaded, successor dispatched, machine destroyed
+17:00 IST  successor boots (~12 min provisioning incl. restore + apps + Docker)
+22:38 IST  self-stop  -> dispatch again  ... and so on, forever
 ```
 
-Gap between sessions: **~10-20 minutes every 6 hours**. A session can never be
-truly continuous — 355 minutes is GitHub's hard ceiling per job.
+Gap between sessions: **~10-15 min**. A session can never be truly continuous —
+355 minutes is GitHub's hard ceiling per job.
 
-If a cron fires while a session is still alive, `concurrency` keeps it
-**pending** instead of starting a second machine. It takes over the moment the
-old one dies. So at 11:30 IST today you will see a second run sitting in
-**pending** for ~5 hours — that is correct behaviour, not a bug.
+`concurrency` keeps at most one running and one pending run, and a newly queued
+run cancels any older pending one, so the chain can never pile up or fork.
 
 ---
 
