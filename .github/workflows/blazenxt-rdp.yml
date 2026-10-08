@@ -174,14 +174,34 @@ jobs:
           }
 
           $password = "${{ secrets.RDP_PASSWORD }}"
-          if ([string]::IsNullOrWhiteSpace($password) -or $password.Trim().Length -lt 8) {
-              Write-Host "[-] Repo secret RDP_PASSWORD is missing or too short."
+          if ([string]::IsNullOrWhiteSpace($password) -or $password.Trim().Length -lt 10) {
+              Write-Host "[-] Repo secret RDP_PASSWORD is missing or shorter than 10 characters."
               Write-Host "[-] This repo is public, so the password CANNOT come from a dispatch input"
               Write-Host "[-] (dispatch inputs are visible on the public run page)."
-              Write-Host "[-] Add it at: Settings > Secrets and variables > Actions > New repository secret"
+              Write-Host "[-] Set it at: Settings > Secrets and variables > Actions"
               exit 1
           }
           $password = $password.Trim()
+
+          # Windows refuses local accounts whose password fails its complexity policy.
+          # Catch that here with a readable message instead of an InvalidPassword crash.
+          $classes = 0
+          if ($password -cmatch '[A-Z]') { $classes++ }
+          if ($password -cmatch '[a-z]') { $classes++ }
+          if ($password -match  '[0-9]') { $classes++ }
+          if ($password -match  '[^A-Za-z0-9]') { $classes++ }
+
+          if ($classes -lt 3) {
+              Write-Host "[-] RDP_PASSWORD fails Windows password complexity."
+              Write-Host "[-] It needs at least 3 of these 4: uppercase, lowercase, digit, symbol."
+              Write-Host "[-] Example that passes: Tz4!mQ8@vR2wL6"
+              exit 1
+          }
+          if ($password.ToLower().Contains($username.ToLower())) {
+              Write-Host "[-] RDP_PASSWORD must not contain the username ($username)."
+              exit 1
+          }
+          Write-Host "[BlazeNXT] Password policy check passed ($($password.Length) chars, $classes/4 character classes)."
           Write-Host "::add-mask::$password"
 
           $secPass = ConvertTo-SecureString $password -AsPlainText -Force
@@ -230,7 +250,7 @@ jobs:
           $dest = 'C:\BlazeNXT\restore'
           Remove-Item -Recurse -Force $dest -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          gh run download $newest.workflow_run.id -n $artName -D $dest 2>$null
+          gh run download $newest.workflow_run.id -n $artName -D $dest --repo $repo 2>$null
           if ($LASTEXITCODE -ne 0) { Write-Host "[BlazeNXT] Download failed - starting clean."; exit 0 }
 
           $src = Get-ChildItem -Path $dest -Recurse -Directory -Filter 'workspace' | Select-Object -First 1
@@ -437,6 +457,7 @@ jobs:
           ($lines -join [Environment]::NewLine) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding UTF8
 
       - name: BlazeNXT Workstation Session Monitor & Keep-Alive
+        id: keepalive
         shell: powershell
         run: |
           $startTime = Get-Date
@@ -485,7 +506,7 @@ jobs:
           }
 
       - name: Stage Session State for Next Session
-        if: ${{ always() && github.event.inputs.persist_state != 'false' }}
+        if: ${{ always() && steps.keepalive.outcome == 'success' && github.event.inputs.persist_state != 'false' }}
         shell: powershell
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -530,7 +551,7 @@ jobs:
           }
 
       - name: Upload Session State for Next Session
-        if: ${{ always() && github.event.inputs.persist_state != 'false' }}
+        if: ${{ always() && steps.keepalive.outcome == 'success' && github.event.inputs.persist_state != 'false' }}
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -541,7 +562,8 @@ jobs:
           if-no-files-found: ignore
 
       - name: Dispatch Next Session (self-chaining)
-        if: ${{ always() && github.event.inputs.chain_next_session != 'false' }}
+        # Only a session that actually ran gets to spawn a successor.
+        if: ${{ always() && steps.keepalive.outcome == 'success' && github.event.inputs.chain_next_session != 'false' }}
         continue-on-error: true
         shell: powershell
         env:
@@ -574,9 +596,9 @@ jobs:
 
           Write-Host "[BlazeNXT] Dispatching the next session so the chain keeps running..."
           if ($argList.Count -gt 0) {
-              & gh workflow run $wf --ref main $argList
+              & gh workflow run $wf --ref main --repo $env:GITHUB_REPOSITORY $argList
           } else {
-              & gh workflow run $wf --ref main
+              & gh workflow run $wf --ref main --repo $env:GITHUB_REPOSITORY
           }
 
           if ($LASTEXITCODE -ne 0) {
@@ -584,4 +606,5 @@ jobs:
           } else {
               Write-Host "[BlazeNXT] Next session queued. It starts as soon as this machine is destroyed."
           }
-          gh run list --workflow=$wf --limit 4 2>$null
+          gh run list --workflow=$wf --repo $env:GITHUB_REPOSITORY --limit 4 2>$null
+          exit 0
