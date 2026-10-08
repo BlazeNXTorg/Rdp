@@ -91,6 +91,45 @@ instructions rather than printing a password into a public log.
 
 ---
 
+## Automation: the 6-hourly cron
+
+`on.schedule: cron '0 */6 * * *'` (UTC) starts a fresh session every 6 hours:
+**05:30 / 11:30 / 17:30 / 23:30 IST**.
+
+The chain works because sessions self-stop at **350 min**, leaving slack before the
+next cron fires. When a cron fires while a session is still live, `concurrency`
+holds it pending rather than double-starting — it takes over the moment the old
+machine dies. Expect a **~10-20 min gap every 6 hours**; a session cannot be truly
+continuous, since 355 min is the hard GitHub ceiling.
+
+**Scheduled runs use one stable node name: `blazenxt-ws`.**
+Manual runs are `blazenxt-ws-<run_id>`. Add the PC to your phone once using
+`blazenxt-ws` and it keeps working across every automated session, because the
+password comes from the `RDP_PASSWORD` secret and never changes.
+
+### Stopping it
+
+Run **BlazeNXT Workstation STOP** (Actions -> Run workflow -> type `STOP`).
+It force-cancels every live session and disables the cron. Force-cancel matters:
+the keep-alive loop ignores a normal cancel.
+
+To bring it back: **Enable workflow** on *BlazeNXT Workstation Cloud RDP*,
+then press **Run workflow** or wait for the next cron tick.
+
+### Cron caveats
+
+- Scheduled workflows are **best-effort**: under load GitHub delays them by
+  5-15+ min or drops individual firings. The pending-queue design absorbs most of it.
+- On a **public** repo GitHub auto-disables scheduled workflows after
+  **60 days of no repository activity**. Push anything to keep it alive.
+- This runs 24x7 on GitHub-hosted runners. GitHub's Additional Product Terms
+  prohibit using hosted runners for activity unrelated to the software project
+  in the repo. The exposure is real: job termination, Actions restriction,
+  repo disabling, account suspension. The STOP workflow is your off-ramp.
+- **Never flip this repo back to private while the cron is on.** Private repos
+  burn the Free plan's 2,000 min/month; 24x7 Windows = ~43,800 min, roughly
+  **$438/month**. Public repos are free and unlimited.
+
 ## Upgrade path
 
 | Want | Needs |
