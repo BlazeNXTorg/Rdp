@@ -21,7 +21,7 @@ quota is ~500 MB, so a 14 GB disk image is impossible.
 **Simple passwords** — the workflow relaxes the local complexity policy via
 `secedit`. Warning: this makes weak passwords possible machine-wide.
 
-## Status: LIVE
+## Status: MANUAL ONLY (cron and auto-chain removed)
 
 | | |
 |---|---|
@@ -35,33 +35,19 @@ quota is ~500 MB, so a 14 GB disk image is impossible.
 
 ---
 
-## How the chain works (two mechanisms)
+## Nothing runs automatically
 
-**1. Self-chaining (primary).** The last step of every session dispatches the next
-run itself, with the same options. The replacement starts the moment the old
-machine dies — no scheduler involved, no waiting on GitHub's cron queue.
+The 6-hourly cron and the self-chaining dispatch have both been removed from the
+workflow, on purpose. Sessions only ever start when a human starts them.
 
-**2. Cron every 6 h (backstop).** `0 */6 * * *` catches the case where a session is
-killed before it reaches its final step (hard 6 h cut, force-cancel, runner failure).
+| Action | How |
+|---|---|
+| Start a session | Actions -> **BlazeNXT Workstation Cloud RDP** -> **Run workflow** |
+| Stop early | Actions -> **BlazeNXT Workstation STOP** -> type `STOP` |
+| Session length | `duration_minutes` input (default 330; GitHub kills at 355) |
 
-Sessions stop at **330 min** so the state upload and the successor dispatch both
-happen before GitHub's 355 min ceiling.
-
-### Raw timeline
-
-```
-16:50 IST  session ends  -> state uploaded, successor dispatched, machine destroyed
-17:00 IST  successor boots (~12 min provisioning incl. restore + apps + Docker)
-22:38 IST  self-stop  -> dispatch again  ... and so on, forever
-```
-
-Gap between sessions: **~10-15 min**. A session can never be truly continuous —
-355 minutes is GitHub's hard ceiling per job.
-
-`concurrency` keeps at most one running and one pending run, and a newly queued
-run cancels any older pending one, so the chain can never pile up or fork.
-
----
+A session still ends by itself at `duration_minutes` so the backup gets written,
+but it does **not** start a successor.
 
 ## Your phone: set it up once
 

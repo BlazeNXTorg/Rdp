@@ -91,7 +91,12 @@ instructions rather than printing a password into a public log.
 
 ---
 
-## Automation: the 6-hourly cron
+## Automation: none - sessions are manual
+
+> This section is kept for history. The cron and the self-chaining dispatch have
+> been **removed**: start a session from the Actions tab, cancel it when done.
+
+### (historical) the 6-hourly cron
 
 `on.schedule: cron '0 */6 * * *'` (UTC) starts a fresh session every 6 hours:
 **05:30 / 11:30 / 17:30 / 23:30 IST**.
